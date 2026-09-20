@@ -182,6 +182,7 @@ input[type=time].fld{flex:1 1 130px}
 .row .rval{font-family:var(--display);font-weight:800;font-size:1.35rem;text-align:right}
 .row .rmeta{color:var(--ink-2);font-size:.84rem}
 .row .chip{justify-self:end;font-size:.78rem;font-weight:800;padding:2px 10px;border-radius:999px;border:1px solid currentColor}
+.chip.miss{color:var(--loss)}.prev.miss{color:var(--loss);font-weight:600}.hint.cut{margin-top:6px}
 .chip.record{color:var(--gold-text)}.chip.win,.chip.tie{color:var(--win)}.chip.loss{color:var(--loss)}.chip.first,.chip.flat{color:var(--ink-2)}
 .empty{color:var(--ink-2);margin:8px 0 0}
 .more{margin-top:10px}
@@ -394,7 +395,7 @@ const LIVE_KEY = 'mvm.live.v1', SOUND_KEY = 'mvm.sound';
    ===================================================================== */
 const KINDS = {
   clock:    { label: 'Clock time', hint: 'Wake-ups, starts, meals. Earlier is better.', less: 'earlier', more: 'later', word: 'Before' },
-  night:    { label: 'Bedtime',    hint: 'Times after midnight count as later.',        less: 'earlier', more: 'later', word: 'Before' },
+  night:    { label: 'Bedtime',    hint: 'Times after midnight count as later. Logged before 5:00 AM? It counts for the day before.',        less: 'earlier', more: 'later', word: 'Before' },
   duration: { label: 'Duration',   hint: 'Hours and minutes. Less is better.',          less: 'less',    more: 'more',  word: 'Under'  }
 };
 function clockParts(m) {
@@ -471,13 +472,20 @@ const todayKey = () => keyOf(nowDate());
 function dateFromKey(k) { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); }
 const dayDiff = (a, b) => Math.round((dateFromKey(b) - dateFromKey(a)) / 86400000);
 function addDays(k, n) { const d = dateFromKey(k); d.setDate(d.getDate() + n); return keyOf(d); }
-function niceDate(k) {
-  const n = dayDiff(k, todayKey());
+/* A bedtime logged between midnight and 5:00 AM still belongs to the night that just ended. */
+const CUT_MIN = 5 * 60;
+function sleepDayKey(d = nowDate()) { const k = keyOf(d); return d.getHours() * 60 + d.getMinutes() < CUT_MIN ? addDays(k, -1) : k; }
+const tkFor = t => (t.kind === 'night' ? sleepDayKey() : todayKey());
+const inGrace = t => t.kind === 'night' && sleepDayKey() !== todayKey();
+const dayStamp = () => todayKey() + '/' + sleepDayKey();
+function niceDate(k, ref = todayKey()) {
+  const n = dayDiff(k, ref);
   if (n === 0) return 'Today';
   if (n === 1) return 'Yesterday';
   return dateFromKey(k).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
 }
-const prevWord = k => (k && dayDiff(k, todayKey()) === 1 ? 'yesterday' : 'your last log');
+const prevWord = (k, ref = todayKey()) => (k && dayDiff(k, ref) === 1 ? 'yesterday' : 'your last log');
+const nd = k => { const x = niceDate(k); return x === 'Today' || x === 'Yesterday' ? x.toLowerCase() : x; };
 
 /* =====================================================================
    Core logic
@@ -495,37 +503,46 @@ function analyze(t) {
   const dates = Object.keys(t.logs).sort();
   let best = t.record, prev = null, prevDate = null;
   const entries = [];
+  /* Bedtime tasks: a night with no log at all (awake past the 5:00 AM cutoff) is a point for old you. */
+  const fill = t.kind === 'night' && dates.length > 0;
+  let expect = dates[0];
+  const missed = d => entries.push({ date: d, value: null, status: 'miss', bestBefore: best, prev, prevDate });
   for (const d of dates) {
+    if (fill) while (expect < d) { missed(expect); expect = addDays(expect, 1); }
     const v = t.logs[d];
     entries.push({ date: d, value: v, status: judge(v, best, prev), bestBefore: best, prev, prevDate });
     if (v < best) best = v;
-    prev = v; prevDate = d;
+    prev = v; prevDate = d; expect = addDays(d, 1);
   }
+  if (fill) { const tkn = tkFor(t); while (expect < tkn) { missed(expect); expect = addDays(expect, 1); } }
   let streak = 0;
   for (let i = entries.length - 1; i >= 0 && POS.has(entries[i].status); i--) streak++;
   return { entries, best, streak };
 }
 function cardModel(t) {
-  const A = analyze(t), tk = todayKey();
+  const A = analyze(t), tk = tkFor(t);
   const todayE = A.entries.find(e => e.date === tk) || null;
-  const before = A.entries.filter(e => e.date < tk);
+  const before = A.entries.filter(e => e.date < tk && e.status !== 'miss');
   const prevE = before.length ? before[before.length - 1] : null;
-  return { A, todayE, prevE, bestBefore: todayE ? todayE.bestBefore : A.best };
+  const missE = A.entries.find(e => e.date === addDays(tk, -1) && e.status === 'miss') || null;
+  return { A, tk, todayE, prevE, missE, bestBefore: todayE ? todayE.bestBefore : A.best };
 }
 function todayScore() {
-  let you = 0, old = 0, logged = 0; const tasks = S().tasks, tk = todayKey();
+  let you = 0, old = 0, logged = 0, miss = 0; const tasks = S().tasks;
   for (const t of tasks) {
-    const e = analyze(t).entries.find(x => x.date === tk);
+    const es = analyze(t).entries, tk = tkFor(t);
+    if (es.some(x => x.date === addDays(tk, -1) && x.status === 'miss')) { old++; miss++; }
+    const e = es.find(x => x.date === tk);
     if (!e) continue; logged++;
     if (POS.has(e.status)) you++; else if (e.status === 'loss') old++;
   }
-  return { you, old, logged, total: tasks.length };
+  return { you, old, logged, miss, total: tasks.length };
 }
 const recordsBroken = () => S().tasks.reduce((n, t) => n + analyze(t).entries.filter(e => e.status === 'record').length, 0);
 function isPerfect() {
-  const tasks = S().tasks, tk = todayKey();
+  const tasks = S().tasks;
   if (tasks.length < 2) return false;
-  return tasks.every(t => { const e = analyze(t).entries.find(x => x.date === tk); return e && POS.has(e.status); });
+  return tasks.every(t => { const tk = tkFor(t), e = analyze(t).entries.find(x => x.date === tk); return e && POS.has(e.status); });
 }
 
 /* =====================================================================
@@ -545,9 +562,9 @@ const TAUNT = {
   loss:   ['Tomorrow is a rematch.', 'One round is not the fight.', 'Use it. Win the next one.'],
   sweep:  ['Old you did not score once today.', 'This is what a proud day feels like.']
 };
-const BADGE = { record: 'Record', win: 'Won', loss: 'Lost', tie: 'Tied', first: 'Baseline', flat: 'Even' };
+const BADGE = { record: 'Record', win: 'Won', loss: 'Lost', tie: 'Tied', first: 'Baseline', flat: 'Even', miss: 'Missed' };
 function resultText(t, e) {
-  const K = KINDS[t.kind], pw = prevWord(e.prevDate);
+  const K = KINDS[t.kind], pw = prevWord(e.prevDate, tkFor(t));
   switch (e.status) {
     case 'record': return `New all-time best, ${fmtDur(e.bestBefore - e.value)} ${K.less} than the old one.`;
     case 'win':    return `Won the day. ${fmtDur(e.prev - e.value)} ${K.less} than ${pw}.`;
@@ -824,7 +841,7 @@ const FX = (() => {
 const stage = $('#stage'), scEl = $('#sc');
 const Q = []; let playing = false, cur = null;
 const later = (fn, ms) => { const id = setTimeout(fn, ms); cur.timers.push(id); return id; };
-const BUZZ = { record: [90, 50, 90, 50, 320], sweep: [90, 50, 90, 50, 90, 50, 400], win: [70, 40, 110], tie: [90], loss: [260], first: [30], added: [30] };
+const BUZZ = { record: [90, 50, 90, 50, 320], sweep: [90, 50, 90, 50, 90, 50, 400], win: [70, 40, 110], tie: [90], loss: [260], miss: [260], first: [30], added: [30] };
 function buzz(type) { try { if (Sound.enabled && !rm() && navigator.vibrate && BUZZ[type]) navigator.vibrate(BUZZ[type]); } catch (e) { /* not supported */ } }
 function celebrate(ev) { Q.push(ev); if (!playing) next(); }
 function next() {
@@ -933,8 +950,8 @@ Show.win = ev => {
   smallShell(ev, 'win', '', `
     <h2 class="headline green">${pick(HEAD.win)}</h2>
     <p class="taskname">${esc(ev.name)}</p>
-    ${duelHTML(ev.kind, { cap: cap(ev.prevDate), v: ev.prev, t: 'dim' }, { cap: 'Today', v: ev.value, t: 'win' })}
-    <p class="delta">${dline(ev, ev.prev, true)} than ${prevWord(ev.prevDate)}.</p>
+    ${duelHTML(ev.kind, { cap: cap(ev.prevDate, ev.ref), v: ev.prev, t: 'dim' }, { cap: 'Today', v: ev.value, t: 'win' })}
+    <p class="delta">${dline(ev, ev.prev, true)} than ${prevWord(ev.prevDate, ev.ref)}.</p>
     <p class="taunt">${pick(TAUNT.win)}</p>
     ${streakLine(ev.streak)}
     <div class="timer"><i></i></div>`);
@@ -954,7 +971,7 @@ Show.tie = ev => {
   FX.pop(window.innerWidth / 2, window.innerHeight * 0.6, 34, ['#ffc857', '#fff2b8', '#ffab00']);
   FX.rocket();
 };
-const cap = d => (d ? niceDate(d) : 'Before');
+const cap = (d, ref) => (d ? niceDate(d, ref) : 'Before');
 
 /* ---- the sad party ---- */
 Show.loss = ev => {
@@ -962,10 +979,27 @@ Show.loss = ev => {
     ${SADBALLOON}
     <h2 class="headline slate">${pick(HEAD.loss)}</h2>
     <p class="taskname">${esc(ev.name)}</p>
-    ${duelHTML(ev.kind, { cap: cap(ev.prevDate), v: ev.prev, t: 'neutral' }, { cap: 'Today', v: ev.value, t: 'loss' })}
-    <p class="delta">${dline(ev, ev.prev, false)} than ${prevWord(ev.prevDate)}.</p>
+    ${duelHTML(ev.kind, { cap: cap(ev.prevDate, ev.ref), v: ev.prev, t: 'neutral' }, { cap: 'Today', v: ev.value, t: 'loss' })}
+    <p class="delta">${dline(ev, ev.prev, false)} than ${prevWord(ev.prevDate, ev.ref)}.</p>
     <p class="taunt">${pick(TAUNT.loss)}</p>
     <button class="cta quiet" id="cta" data-act="close">Rematch tomorrow</button>
+    <div class="timer"><i></i></div>`, BEAMS_SAD);
+  $('.timer').style.setProperty('--dur', '6500ms');
+  Sound.sad();
+  FX.set('rain', 9); FX.set('sad', 1.1);
+  allowDismiss(900, false);
+  later(() => { cur.canDismiss = true; close(); }, 6500);
+};
+
+/* ---- a night with no log: old you takes the point ---- */
+Show.miss = ev => {
+  open('sad revealed', `
+    ${SADBALLOON}
+    <h2 class="headline slate">Old you scores</h2>
+    <p class="taskname">${esc(ev.name)}</p>
+    <p class="delta">${ev.count > 1 ? ev.count + ' nights went unlogged.' : 'Nothing logged for ' + nd(ev.date) + '.'}</p>
+    <p class="taunt">${ev.count > 1 ? 'That is ' + ev.count + ' points to old you.' : 'That is one point to old you.'} Tonight is a rematch.</p>
+    <button class="cta quiet" id="cta" data-act="close">Rematch tonight</button>
     <div class="timer"><i></i></div>`, BEAMS_SAD);
   $('.timer').style.setProperty('--dur', '6500ms');
   Sound.sad();
@@ -984,7 +1018,7 @@ function toast(html, ms, cb) {
   later(() => { el.hidden = true; cur = null; next(); }, ms + 300);
 }
 Show.first = ev => toast(`Baseline set for ${esc(ev.name)}<small>The fight starts tomorrow. Beat ${fmt(ev.kind, ev.value)}.</small>`, 3200, () => { Sound.pop(); FX.pop(window.innerWidth / 2, window.innerHeight - 90, 22, ['#ffc857', '#fff2b8']); });
-Show.flat = ev => toast(`Dead even with ${prevWord(ev.prevDate)}<small>${esc(ev.name)}. Edge it tomorrow.</small>`, 2800, () => Sound.tick());
+Show.flat = ev => toast(`Dead even with ${prevWord(ev.prevDate, ev.ref)}<small>${esc(ev.name)}. Edge it tomorrow.</small>`, 2800, () => Sound.tick());
 Show.added = ev => toast(`New rival added: ${esc(ev.name)}<small>Beat ${fmt(ev.kind, ev.value)} and the party starts.</small>`, 3200, () => { Sound.pop(); Sound.pop(0.1); FX.pop(window.innerWidth / 2, window.innerHeight - 90, 36); });
 
 /* close on tap, Esc, or the button */
@@ -1030,11 +1064,11 @@ async function initCloud() {
 const drafts = {};            // typed-but-not-logged input values, keyed "taskId:part"
 const editing = new Set();    // task ids being re-logged today
 const removing = new Set();   // task ids awaiting remove confirmation
-let justLogged = null, logLimit = 7, addOpen = false, addKind = 'clock', renderedDay = todayKey();
+let justLogged = null, logLimit = 7, addOpen = false, addKind = 'clock', renderedDay = dayStamp();
 const STATE_CLASS = { record: 'hot', win: 'win', tie: 'hot', loss: 'loss', first: 'neutral', flat: 'neutral' };
 
 function sparkHTML(A) {
-  const es = A.entries.slice(-14); if (es.length < 2) return '';
+  const es = A.entries.filter(e => e.status !== 'miss').slice(-14); if (es.length < 2) return '';
   const vals = es.map(e => e.value), best = A.best;
   let mn = Math.min(...vals, best), mx = Math.max(...vals, best); if (mx === mn) { mx += 1; mn -= 1; }
   const Wd = 300, Ht = 40, pad = 6, X = i => (es.length === 1 ? Wd / 2 : 4 + (i / (es.length - 1)) * (Wd - 8)), Y = v => pad + ((v - mn) / (mx - mn)) * (Ht - 2 * pad);
@@ -1064,7 +1098,7 @@ function entryHTML(t, todayE, editingNow) {
   return `<div class="entry">${input}${now}<button class="btn" data-act="log">${editingNow ? 'Update log' : 'Log it'}</button>${cancel}</div><p class="msg" role="status"></p>`;
 }
 function cardHTML(t) {
-  const { A, todayE, prevE, bestBefore } = cardModel(t);
+  const { A, tk, todayE, prevE, missE, bestBefore } = cardModel(t);
   const K = KINDS[t.kind], ed = editing.has(t.id);
   const state = todayE && !ed ? todayE.status : 'pending';
   const fresh = justLogged === t.id;
@@ -1076,10 +1110,13 @@ function cardHTML(t) {
     if (prevE && prevE.value > bestBefore) hint = `${w} ${fmt(t.kind, prevE.value)} wins the day. ${w} ${fmt(t.kind, bestBefore)} breaks the record.`;
     else if (prevE) hint = `${w} ${fmt(t.kind, bestBefore)} wins the day and breaks the record.`;
     else hint = `Today sets your baseline. ${w} ${fmt(t.kind, bestBefore)} breaks the record.`;
+    if (t.kind === 'night') hint += ' Anything logged before 5:00 AM counts for the day before.';
   }
-  const prevLine = prevE
-    ? `<p class="prev"><span>${niceDate(prevE.date)}</span><b>${fmt(t.kind, prevE.value)}</b></p>`
+  let prevLine = prevE
+    ? `<p class="prev"><span>${niceDate(prevE.date, tk)}</span><b>${fmt(t.kind, prevE.value)}</b></p>`
     : `<p class="prev">No earlier log yet. Today sets the baseline.</p>`;
+  if (missE) prevLine += `<p class="prev miss">${niceDate(missE.date, tk)}: nothing logged. Old you took the point.</p>`;
+  const grace = inGrace(t) ? `<p class="hint cut">Still counting for ${nd(tk)}'s night. The day rolls over at 5:00 AM.</p>` : '';
   const body = state === 'pending'
     ? entryHTML(t, todayE, ed) + `<p class="hint">${hint}</p>`
     : `<div class="result"><span class="badge ${state}">${BADGE[state]}</span><span>${esc(resultText(t, todayE))}</span><button class="link" data-act="change">Change</button></div>`;
@@ -1098,7 +1135,7 @@ function cardHTML(t) {
       <div class="side today"><span class="cap">Today</span>${todayTiles}</div>
     </div>
     ${prevLine}
-    ${body}
+    ${body}${grace}
     ${sparkHTML(A)}
     ${foot}
   </article>`;
@@ -1126,7 +1163,7 @@ function renderHero() {
   const sc = todayScore(), rb = recordsBroken(), num = n => tilesHTML(digits(n), 'neutral');
   $('#today').textContent = nowDate().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
   $('#score').innerHTML = `<span class="who">You</span>${num(sc.you)}<span class="sep">:</span>${num(sc.old)}<span class="who">Old you</span>`;
-  $('#hero-sub').textContent = `${sc.logged} of ${sc.total} logged today. ${rb === 0 ? 'No records broken yet.' : rb === 1 ? '1 record broken so far.' : rb + ' records broken so far.'}`;
+  $('#hero-sub').textContent = `${sc.logged} of ${sc.total} logged today. ${rb === 0 ? 'No records broken yet.' : rb === 1 ? '1 record broken so far.' : rb + ' records broken so far.'}${sc.miss ? ' Old you took a point for last night.' : ''}`;
   const b = $('#sound'); const on = Sound.enabled;
   b.innerHTML = on ? ICON_SOUND_ON : ICON_SOUND_OFF; b.setAttribute('aria-pressed', String(on)); b.setAttribute('aria-label', on ? 'Sound on' : 'Sound off');
 }
@@ -1139,13 +1176,14 @@ function renderLog() {
   $('#logbook').innerHTML = shown.map(d => {
     const rows = byDay[d].map(({ t, e }) => {
       const K = KINDS[t.kind];
+      if (e.status === 'miss') return `<li class="row"><span class="rname">${esc(t.name)}</span><span class="rval">–</span><span class="rmeta">Nothing logged. One point to old you.</span><span class="chip miss">${BADGE.miss}</span></li>`;
       let meta = '';
       if (e.status === 'record') meta = `${fmtDur(e.bestBefore - e.value)} ${K.less} than the old best`;
       else if (e.status === 'win') meta = `${fmtDur(e.prev - e.value)} ${K.less} than the last log`;
       else if (e.status === 'loss') meta = `${fmtDur(e.value - e.prev)} ${K.more} than the last log`;
       return `<li class="row"><span class="rname">${esc(t.name)}</span><span class="rval">${fmt(t.kind, e.value)}</span><span class="rmeta">${meta}</span><span class="chip ${e.status}">${BADGE[e.status]}</span></li>`;
     }).join('');
-    return `<div class="day"><h4>${niceDate(d)}<span>${byDay[d].length} of ${S().tasks.length} logged</span></h4><ul class="rows">${rows}</ul></div>`;
+    return `<div class="day"><h4>${niceDate(d)}<span>${byDay[d].filter(x => x.e.status !== 'miss').length} of ${S().tasks.length} logged</span></h4><ul class="rows">${rows}</ul></div>`;
   }).join('') + (days.length > logLimit ? `<button class="btn ghost more" data-act="more">Show older days</button>` : '');
 }
 function renderSync() {
@@ -1155,7 +1193,7 @@ function renderSync() {
     : 'Saved on this device.';
 }
 function renderAll() {
-  renderedDay = todayKey();
+  renderedDay = dayStamp();
   renderHero(); renderCards(); renderLog(); renderSync(); updatePortal();
 }
 function updatePortal() {
@@ -1182,10 +1220,10 @@ function readValue(root, kind) {
   return { v };
 }
 function evFrom(t, e, A) {
-  return { type: e.status, task: t, name: t.name, kind: t.kind, value: e.value, oldBest: e.bestBefore, prev: e.prev, prevDate: e.prevDate, streak: A.streak };
+  return { type: e.status, task: t, name: t.name, kind: t.kind, value: e.value, oldBest: e.bestBefore, prev: e.prev, prevDate: e.prevDate, streak: A.streak, ref: tkFor(t) };
 }
 function commitLog(t, v) {
-  const wasPerfect = isPerfect(), tk = todayKey();
+  const wasPerfect = isPerfect(), tk = tkFor(t);
   t.logs[tk] = v; touch();
   const A = analyze(t), e = A.entries.find(x => x.date === tk);
   justLogged = t.id; renderAll();
@@ -1258,8 +1296,28 @@ document.addEventListener('click', e => {
    Boot
    ===================================================================== */
 renderAll(); renderAdd();
-setInterval(() => { updatePortal(); if (todayKey() !== renderedDay && !playing) renderAll(); }, 30000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden && todayKey() !== renderedDay && !playing) renderAll(); });
+/* Missed nights: celebrate (sadly) once per night. Existing history is acknowledged silently the first time. */
+function checkMisses() {
+  let changed = false;
+  for (const t of S().tasks) {
+    if (t.kind !== 'night') continue;
+    const ms = analyze(t).entries.filter(e => e.status === 'miss'), ack = t.missAck || '';
+    const fresh = ms.filter(e => e.date > ack);
+    if (!fresh.length) continue;
+    t.missAck = fresh[fresh.length - 1].date; changed = true;
+    celebrate({ type: 'miss', name: t.name, kind: t.kind, count: fresh.length, date: t.missAck });
+  }
+  if (changed) touch();
+}
+function initMisses() {
+  if (live.missMigrated) { checkMisses(); return; }
+  live.tasks.forEach(t => { if (t.kind === 'night') { const ms = analyze(t).entries.filter(e => e.status === 'miss'); t.missAck = ms.length ? ms[ms.length - 1].date : ''; } });
+  live.missMigrated = true; touch();
+}
+function rollover() { if (dayStamp() !== renderedDay && !playing) { renderAll(); checkMisses(); } }
+initMisses();
+setInterval(() => { updatePortal(); rollover(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) rollover(); });
 initCloud();
 })();
 </script>
